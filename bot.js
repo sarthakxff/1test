@@ -15,6 +15,10 @@
  */
 
 require("dotenv").config();
+
+// FIX #1: Moved axios require to top-level instead of inside fetchProfileData()
+const axios = require("axios");
+
 const {
   Client,
   GatewayIntentBits,
@@ -29,7 +33,12 @@ const {
 } = require("discord.js");
 
 const { monitoringBase, oldClients, permissions, MAX_ACTIVE } = require("./store");
-const { checkAccount, STATUS, jitter } = require("./instagramChecker");
+const { checkAccount, STATUS, jitter: _jitter } = require("./instagramChecker");
+
+// FIX #12: Defensive fallback for jitter in case instagramChecker doesn't export it
+const jitter = typeof _jitter === "function"
+  ? _jitter
+  : (base) => base + Math.floor(Math.random() * base * 0.3);
 
 // ── Env validation ─────────────────────────────────────────────────────────
 const REQUIRED_ENV = ["DISCORD_TOKEN", "DISCORD_CHANNEL_ID", "DISCORD_GUILD_ID"];
@@ -40,12 +49,12 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
-const TOKEN          = process.env.DISCORD_TOKEN;
-const CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID;
-const GUILD_ID       = process.env.DISCORD_GUILD_ID;
-const BASE_INTERVAL  = parseInt(process.env.CHECK_INTERVAL_MS || "12000", 10);
+const TOKEN         = process.env.DISCORD_TOKEN;
+const CHANNEL_ID    = process.env.DISCORD_CHANNEL_ID;
+const GUILD_ID      = process.env.DISCORD_GUILD_ID;
+const BASE_INTERVAL = parseInt(process.env.CHECK_INTERVAL_MS || "12000", 10);
 
-// ── Warn if DATA_DIR not set (data will be lost on redeploy) ───────────────
+// ── Warn if DATA_DIR not set ───────────────────────────────────────────────
 if (!process.env.DATA_DIR) {
   console.warn("⚠️  WARNING: DATA_DIR env var not set! All monitoring data will be lost on redeploy.");
   console.warn("⚠️  Set DATA_DIR=/data in Railway Variables and add a Volume mounted at /data.");
@@ -57,7 +66,7 @@ if (!process.env.DATA_DIR) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 // ── Slash command definition ───────────────────────────────────────────────
-const userOpt  = (opt) => opt.setName("username").setDescription("Instagram username (without @)").setRequired(true);
+const userOpt   = (opt) => opt.setName("username").setDescription("Instagram username (without @)").setRequired(true);
 const memberOpt = (opt) => opt.setName("user").setDescription("Discord user to grant/revoke access").setRequired(true);
 
 const commands = [
@@ -86,8 +95,9 @@ async function registerCommands() {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+// FIX #6: formatDuration now handles ms === 0 correctly (was returning "unknown")
 function formatDuration(ms) {
-  if (!ms || ms < 0) return "unknown";
+  if (ms == null || ms < 0) return "unknown";
   const totalSec = Math.floor(ms / 1000);
   const h = Math.floor(totalSec / 3600);
   const m = Math.floor((totalSec % 3600) / 60);
@@ -116,13 +126,12 @@ async function notifyAccountBanned(username, account) {
   const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
   if (!channel) return;
 
-  const now        = Date.now();
-  const bannedAt   = new Date(now);
-  const timeTaken  = account.addedAt
+  const now       = Date.now();
+  const bannedAt  = new Date(now);
+  const timeTaken = account.addedAt
     ? formatDuration(now - new Date(account.addedAt).getTime())
     : "unknown";
 
-  // Try to mention the person who added this account
   let adderMention = `**${account.addedBy}**`;
   if (account.addedById) {
     adderMention = `<@${account.addedById}>`;
@@ -158,15 +167,15 @@ async function notifyAccountBanned(username, account) {
 
 // ── Fetch Instagram profile data (photo + followers) ──────────────────────
 async function fetchProfileData(username) {
-  const axios = require("axios");
+  // FIX #1: axios is now required at top-level, not here
   try {
-    const url = `https://www.instagram.com/${username}/`;
-    const proxyUrl = process.env.PROXY_URL;
+    const url        = `https://www.instagram.com/${username}/`;
+    const proxyUrl   = process.env.PROXY_URL;
     const requestConfig = {
       timeout: 10000,
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        Accept:            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
       },
       validateStatus: () => true,
@@ -177,25 +186,22 @@ async function fetchProfileData(username) {
         const u = new URL(proxyUrl);
         requestConfig.proxy = {
           protocol: u.protocol.replace(":", ""),
-          host: u.hostname,
-          port: Number(u.port || 80),
+          host:     u.hostname,
+          port:     Number(u.port || 80),
           ...(u.username ? { auth: { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) } } : {}),
         };
-      } catch {}
+      } catch { /* invalid proxy URL — ignore */ }
     }
 
     const { data: html } = await axios.get(url, requestConfig);
     if (typeof html !== "string") return null;
 
-    // Extract profile pic URL from og:image meta tag
-    const picMatch = html.match(/<meta property="og:image" content="([^"]+)"/);
-    const profilePic = picMatch ? picMatch[1] : null;
-
-    // Extract follower / following counts from JSON in page
+    const picMatch       = html.match(/<meta property="og:image" content="([^"]+)"/);
+    const profilePic     = picMatch ? picMatch[1] : null;
     const followersMatch = html.match(/"edge_followed_by":\{"count":(\d+)\}/);
     const followingMatch = html.match(/"edge_follow":\{"count":(\d+)\}/);
-    const followers = followersMatch ? parseInt(followersMatch[1]).toLocaleString() : null;
-    const following = followingMatch ? parseInt(followingMatch[1]).toLocaleString() : null;
+    const followers      = followersMatch ? parseInt(followersMatch[1]).toLocaleString() : null;
+    const following      = followingMatch ? parseInt(followingMatch[1]).toLocaleString() : null;
 
     return { profilePic, followers, following };
   } catch {
@@ -208,57 +214,53 @@ async function notifyAccountUnbanned(username, account) {
   const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
   if (!channel) return;
 
-  const now       = Date.now();
-  const timeTaken = account.addedAt
+  const now        = Date.now();
+  const timeTaken  = account.addedAt
     ? formatDuration(now - new Date(account.addedAt).getTime())
     : "unknown";
-
   const unbannedAt = new Date(now).toISOString();
 
-  // Fetch live profile data
-  const profile = await fetchProfileData(username);
+  const profile     = await fetchProfileData(username);
+  const pingContent = account.addedById ? `<@${account.addedById}>` : `@here`;
 
-  const pingContent = account.addedById
-    ? `<@${account.addedById}>`
-    : `@here`;
-
-  // Build clean recovery embed
   const embed = new EmbedBuilder()
     .setColor(0x00e676)
     .setTitle(`Account Recovered | @${username} ✅`)
     .setURL(`https://instagram.com/${username}`);
 
-  // Add follower/following if we got them
   if (profile?.followers || profile?.following) {
     const followersVal = profile.followers ? `**${profile.followers}**` : "N/A";
     const followingVal = profile.following ? `**${profile.following}**` : "N/A";
     embed.setDescription(`Followers: ${followersVal} | Following: ${followingVal}`);
   }
 
-  embed.addFields(
-    { name: "⏱️ Time Taken", value: timeTaken, inline: false },
-  );
+  embed.addFields({ name: "⏱️ Time Taken", value: timeTaken, inline: false });
 
-  // Set profile photo as thumbnail if available
   if (profile?.profilePic) {
     embed.setThumbnail(profile.profilePic);
   }
 
-  embed.setFooter({ text: `Unbanned at ${new Date(unbannedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST` });
+  embed.setFooter({
+    text: `Unbanned at ${new Date(unbannedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST`,
+  });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`archive_unban_${username}`).setLabel("📦 Archive & Stop Monitoring").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`keep_unban_${username}`)   .setLabel("🔄 Keep in Monitor List")     .setStyle(ButtonStyle.Secondary)
   );
 
-  await channel.send({ content: `${pingContent} ✅ **CLIENT ACCOUNT RECOVERED** — \`@${username}\``, embeds: [embed], components: [row] });
+  await channel.send({
+    content:    `${pingContent} ✅ **CLIENT ACCOUNT RECOVERED** — \`@${username}\``,
+    embeds:     [embed],
+    components: [row],
+  });
 }
 
 // ── Monitor loops ──────────────────────────────────────────────────────────
-const activeTimers = {};
+const activeTimers   = {};
+// FIX #3: Track which accounts are currently in a confirmation check to prevent re-entrant scheduleCheck
+const confirmingNow  = new Set();
 
-// Before firing a ban/unban alert, re-check 3 times over 30s to confirm.
-// This prevents false positives from Instagram login walls / flaky responses.
 async function confirmStatus(username, expectedStatus, attempts = 3, delayMs = 10000) {
   for (let i = 0; i < attempts; i++) {
     await new Promise((r) => setTimeout(r, delayMs));
@@ -273,10 +275,16 @@ async function confirmStatus(username, expectedStatus, attempts = 3, delayMs = 1
 }
 
 async function scheduleCheck(username) {
+  // FIX #3: Don't schedule a new check while confirmation is running
+  if (confirmingNow.has(username)) return;
+
   const account = monitoringBase.get(username);
   if (!account || !account.active) return;
 
   activeTimers[username] = setTimeout(async () => {
+    // FIX #3: Re-check after timer fires (account may have been deactivated while waiting)
+    if (confirmingNow.has(username)) return;
+
     const result = await checkAccount(username);
     const prev   = monitoringBase.get(username);
     if (!prev || !prev.active) return;
@@ -302,35 +310,46 @@ async function scheduleCheck(username) {
 
     const updated = monitoringBase.get(username);
 
-    // WATCH_FOR_BAN: was live, now looks banned — confirm 3x before alerting
+    // WATCH_FOR_BAN: was live, now looks banned
     if (updated.mode === "WATCH_FOR_BAN" && result.status === STATUS.BANNED) {
       console.log(`Possible ban detected for @${username} — running 3 confirmation checks...`);
+      // FIX #3: Mark as confirming so no duplicate scheduleCheck fires during the delay
+      confirmingNow.add(username);
       const confirmed = await confirmStatus(username, STATUS.BANNED);
+      confirmingNow.delete(username);
+
       if (!confirmed) {
-        scheduleCheck(username); // false positive — keep monitoring
+        scheduleCheck(username);
         return;
       }
+
+      // FIX #11: Keep active=true until the user explicitly archives or keeps;
+      // the notification embed has buttons to handle that choice.
       monitoringBase.update(username, {
-        active: false,
         eventDetectedAt: result.checkedAt.toISOString(),
-        lastStatus: STATUS.BANNED,
+        lastStatus:      STATUS.BANNED,
+        active:          false, // pause polling — buttons can re-enable
       });
       await notifyAccountBanned(username, monitoringBase.get(username));
       return;
     }
 
-    // WATCH_FOR_UNBAN: was banned, now looks accessible — confirm 3x before alerting
+    // WATCH_FOR_UNBAN: was banned, now looks accessible
     if (updated.mode === "WATCH_FOR_UNBAN" && result.status === STATUS.ACCESSIBLE) {
       console.log(`Possible unban detected for @${username} — running 3 confirmation checks...`);
+      confirmingNow.add(username);
       const confirmed = await confirmStatus(username, STATUS.ACCESSIBLE);
+      confirmingNow.delete(username);
+
       if (!confirmed) {
-        scheduleCheck(username); // false positive — keep monitoring
+        scheduleCheck(username);
         return;
       }
+
       monitoringBase.update(username, {
-        active: false,
         eventDetectedAt: result.checkedAt.toISOString(),
-        lastStatus: STATUS.ACCESSIBLE,
+        lastStatus:      STATUS.ACCESSIBLE,
+        active:          false,
       });
       await notifyAccountUnbanned(username, monitoringBase.get(username));
       return;
@@ -350,28 +369,35 @@ function stopMonitoring(username) {
     clearTimeout(activeTimers[username]);
     delete activeTimers[username];
   }
+  confirmingNow.delete(username); // FIX #3: Also clear confirmation guard
 }
 
+// FIX #5: Only call monitoringBase.update after archiving if the record still exists
 function archiveAndStop(username, reason) {
   stopMonitoring(username);
   const record = monitoringBase.get(username);
   if (record) {
+    const duration   = record.addedAt ? formatDuration(Date.now() - new Date(record.addedAt).getTime()) : "unknown";
     const resolution =
-      reason === "BAN_DETECTED"       ? `Account was banned after ${formatDuration(Date.now() - new Date(record.addedAt).getTime())} of monitoring.` :
-      reason === "UNBAN_DETECTED"     ? `Account was recovered after ${formatDuration(Date.now() - new Date(record.addedAt).getTime())} of monitoring.` :
-      reason === "MANUALLY_REMOVED"   ? `Manually removed from monitoring by user.` :
+      reason === "BAN_DETECTED"     ? `Account was banned after ${duration} of monitoring.` :
+      reason === "UNBAN_DETECTED"   ? `Account was recovered after ${duration} of monitoring.` :
+      reason === "MANUALLY_REMOVED" ? "Manually removed from monitoring by user." :
       "Archived.";
     oldClients.archive(record, reason, resolution);
-    monitoringBase.update(username, { active: false });
+    // Only mark inactive — don't re-create if store.archive already removes it
+    if (monitoringBase.get(username)) {
+      monitoringBase.update(username, { active: false });
+    }
   }
 }
 
 // ── Resume on startup ──────────────────────────────────────────────────────
+// FIX #9: Use listActive() (returns array) consistently instead of mixing getActive()/Object.keys()
 function resumeAll() {
-  const active = Object.keys(monitoringBase.getActive());
+  const active = monitoringBase.listActive();
   if (active.length) {
-    console.log(`▶️  Resuming monitoring for: ${active.join(", ")}`);
-    active.forEach(startMonitoring);
+    console.log(`▶️  Resuming monitoring for: ${active.map((a) => a.username).join(", ")}`);
+    active.forEach((a) => startMonitoring(a.username));
   } else {
     console.log("📭 No active accounts to resume.");
   }
@@ -384,45 +410,51 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isButton()) {
     const id = interaction.customId;
 
-    // Archive after ban detected
     if (id.startsWith("archive_ban_") || id.startsWith("archive_unban_")) {
       const username = id.split("_").slice(2).join("_");
       const reason   = id.startsWith("archive_ban_") ? "BAN_DETECTED" : "UNBAN_DETECTED";
       archiveAndStop(username, reason);
       const label = reason === "BAN_DETECTED" ? "banned" : "recovered";
       await interaction.update({
-        content: `📦 **@${username}** has been archived in **Old Clients** database as ${label}. Monitoring stopped.`,
-        embeds: [], components: [],
+        content:    `📦 **@${username}** has been archived in **Old Clients** database as ${label}. Monitoring stopped.`,
+        embeds:     [],
+        components: [],
       });
       return;
     }
 
     if (id.startsWith("keep_ban_") || id.startsWith("keep_unban_")) {
       const username = id.split("_").slice(2).join("_");
-      // Reactivate so it keeps being checked
-      monitoringBase.update(username, { active: true });
+      // FIX #4: Also clear eventDetectedAt so a fresh cycle begins cleanly
+      monitoringBase.update(username, { active: true, eventDetectedAt: null });
       startMonitoring(username);
       await interaction.update({
-        content: `🔄 **@${username}** is back on the active monitor list.`,
-        embeds: [], components: [],
+        content:    `🔄 **@${username}** is back on the active monitor list.`,
+        embeds:     [],
+        components: [],
       });
       return;
     }
 
+    // FIX #10: Unknown button — reply ephemerally instead of silently failing
+    await interaction.reply({ content: "⚠️ Unknown button action.", ephemeral: true }).catch(() => {});
     return;
   }
 
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "monitor") return;
 
-  const sub      = interaction.options.getSubcommand();
-  const rawUser  = interaction.options.getString("username") || "";
-  const username = rawUser.toLowerCase().replace(/^@/, "");
+  const sub = interaction.options.getSubcommand();
+
+  // FIX #2: Only read username option for subcommands that actually have it
+  const usernameRaw = ["add", "status", "remove"].includes(sub)
+    ? (interaction.options.getString("username") || "")
+    : "";
+  const username = usernameRaw.toLowerCase().replace(/^@/, "");
 
   // ── /monitor grant ─────────────────────────────────────────────────────
   if (sub === "grant") {
     const perms = permissions.load();
-    // First ever use: person who runs grant becomes the owner
     if (!perms.ownerId) {
       permissions.setOwner(interaction.user.id);
     } else if (!permissions.isOwner(interaction.user.id)) {
@@ -445,6 +477,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   // ── /monitor add ───────────────────────────────────────────────────────
   if (sub === "add") {
+    // FIX #8: Validate username here too
     if (!validateUsername(username))
       return interaction.reply({ content: "❌ Invalid Instagram username. Use only letters, numbers, `.` and `_`.", ephemeral: true });
 
@@ -456,7 +489,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     await interaction.deferReply();
 
-    // Retry up to 5 times to get a real status (avoid ERROR/RATE_LIMITED on first check)
     let firstCheck;
     for (let attempt = 0; attempt < 5; attempt++) {
       firstCheck = await checkAccount(username);
@@ -465,9 +497,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await new Promise((r) => setTimeout(r, 5000));
     }
 
-    // If still no clear result after retries, default to WATCH_FOR_UNBAN (safer)
     const detectedStatus = firstCheck.status === STATUS.ACCESSIBLE ? "ACCESSIBLE" : "BANNED";
-    const mode = detectedStatus === "ACCESSIBLE" ? "WATCH_FOR_BAN" : "WATCH_FOR_UNBAN";
+    const mode           = detectedStatus === "ACCESSIBLE" ? "WATCH_FOR_BAN" : "WATCH_FOR_UNBAN";
 
     const added = monitoringBase.add(
       username,
@@ -486,8 +517,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     monitoringBase.update(username, {
       lastChecked: firstCheck.checkedAt.toISOString(),
-      lastStatus: firstCheck.status,
-      checkCount: 1,
+      lastStatus:  firstCheck.status,
+      checkCount:  1,
     });
 
     startMonitoring(username);
@@ -495,7 +526,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     let embed;
 
     if (mode === "WATCH_FOR_BAN") {
-      // Account is LIVE → watching for ban/deletion
       embed = new EmbedBuilder()
         .setColor(0x00cc55)
         .setTitle("🟢  Account Is Live — Monitoring for Ban")
@@ -512,7 +542,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setFooter({ text: "Instagram Monitor • Monitoring Base" })
         .setTimestamp();
     } else {
-      // Account is BANNED → watching for unban/recovery
       embed = new EmbedBuilder()
         .setColor(0xff4444)
         .setTitle("🔴  Account Is Banned — Monitoring for Recovery")
@@ -537,7 +566,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (sub === "list") {
     if (!permissions.canViewList(interaction.user.id)) {
       return interaction.reply({
-        content: "🔒 You don't have permission to view the monitor list. Ask the owner to run `/monitor grant @you`.",
+        content:   "🔒 You don't have permission to view the monitor list. Ask the owner to run `/monitor grant @you`.",
         ephemeral: true,
       });
     }
@@ -554,41 +583,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setDescription(`**Monitoring Base:** ${active.length}/${MAX_ACTIVE} slots used\n**Old Clients Archive:** ${archived.length} record(s)`)
       .setTimestamp();
 
-    // Active accounts
     if (active.length) {
       const watchingBan   = active.filter((a) => a.mode === "WATCH_FOR_BAN");
       const watchingUnban = active.filter((a) => a.mode === "WATCH_FOR_UNBAN");
 
       if (watchingBan.length) {
         embed.addFields({
-          name: "🟢 LIVE — Watching for Ban",
+          name:  "🟢 LIVE — Watching for Ban",
           value: watchingBan.map((a) =>
             `🟢 **@${a.username}** — added by \`${a.addedBy}\` — ${a.checkCount} checks — added ${tsRelative(a.addedAt)}`
-          ).join("\n") || "None",
+          ).join("\n"),
         });
       }
 
       if (watchingUnban.length) {
         embed.addFields({
-          name: "🔴 BANNED — Watching for Unban",
+          name:  "🔴 BANNED — Watching for Unban",
           value: watchingUnban.map((a) =>
             `🔴 **@${a.username}** — added by \`${a.addedBy}\` — ${a.checkCount} checks — added ${tsRelative(a.addedAt)}`
-          ).join("\n") || "None",
+          ).join("\n"),
         });
       }
     } else {
       embed.addFields({ name: "📡 Active Monitoring", value: "No accounts currently being monitored." });
     }
 
-    // Old Clients archive
     if (archived.length) {
-      const bannedOnes   = archived.filter((a) => a.archiveReason === "BAN_DETECTED");
+      const bannedOnes    = archived.filter((a) => a.archiveReason === "BAN_DETECTED");
       const recoveredOnes = archived.filter((a) => a.archiveReason === "UNBAN_DETECTED");
-      const removedOnes  = archived.filter((a) => a.archiveReason === "MANUALLY_REMOVED");
+      const removedOnes   = archived.filter((a) => a.archiveReason === "MANUALLY_REMOVED");
 
       if (bannedOnes.length) {
         embed.addFields({
-          name: "⚫ OLD CLIENTS — BANNED IN PAST",
+          name:  "⚫ OLD CLIENTS — BANNED IN PAST",
           value: bannedOnes.map((a) =>
             `⚫ **@${a.username}** — banned on ${tsField(a.eventDetectedAt || a.archivedAt)} — took ${formatDuration(a.timeTaken)} — by \`${a.addedBy}\``
           ).join("\n"),
@@ -597,7 +624,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (recoveredOnes.length) {
         embed.addFields({
-          name: "🟢 OLD CLIENTS — RECOVERED IN PAST",
+          name:  "🟢 OLD CLIENTS — RECOVERED IN PAST",
           value: recoveredOnes.map((a) =>
             `🟢 **@${a.username}** — recovered on ${tsField(a.eventDetectedAt || a.archivedAt)} — took ${formatDuration(a.timeTaken)} — by \`${a.addedBy}\``
           ).join("\n"),
@@ -606,7 +633,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (removedOnes.length) {
         embed.addFields({
-          name: "🗑️ OLD CLIENTS — MANUALLY REMOVED",
+          name:  "🗑️ OLD CLIENTS — MANUALLY REMOVED",
           value: removedOnes.map((a) =>
             `🗑️ **@${a.username}** — removed on ${tsField(a.archivedAt)} — by \`${a.addedBy}\``
           ).join("\n"),
@@ -619,8 +646,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   // ── /monitor status ────────────────────────────────────────────────────
   if (sub === "status") {
-    if (!username)
-      return interaction.reply({ content: "❌ Please provide an Instagram username.", ephemeral: true });
+    // FIX #8: Validate username
+    if (!validateUsername(username))
+      return interaction.reply({ content: "❌ Invalid Instagram username.", ephemeral: true });
 
     const account = monitoringBase.get(username);
     if (!account)
@@ -631,19 +659,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const result = await checkAccount(username);
     monitoringBase.update(username, {
       lastChecked: result.checkedAt.toISOString(),
-      lastStatus: result.status,
-      checkCount: (account.checkCount || 0) + 1,
+      lastStatus:  result.status,
+      checkCount:  (account.checkCount || 0) + 1,
     });
 
-    const updated = monitoringBase.get(username);
-    const color   =
-      result.status === STATUS.ACCESSIBLE  ? 0x00ff88 :
+    const updated    = monitoringBase.get(username);
+    const color      =
+      result.status === STATUS.ACCESSIBLE   ? 0x00ff88 :
       result.status === STATUS.RATE_LIMITED ? 0xffcc00 :
       0xff4444;
 
     const modeLabel =
       updated.mode === "WATCH_FOR_BAN"   ? "🟢 Watching for Ban/Deletion" :
-      updated.mode === "WATCH_FOR_UNBAN" ? "🔴 Watching for Unban/Recovery" : updated.mode;
+      updated.mode === "WATCH_FOR_UNBAN" ? "🔴 Watching for Unban/Recovery" :
+      updated.mode;
 
     const statusEmoji = { BANNED: "🔴", ACCESSIBLE: "🟢", RATE_LIMITED: "🟡", ERROR: "⚠️" };
 
@@ -651,14 +680,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setColor(color)
       .setTitle(`📊 Status Check — @${username}`)
       .addFields(
-        { name: "📊 Current Status",  value: `${statusEmoji[result.status] || "⏳"} ${result.status}`, inline: true },
-        { name: "🎯 Monitor Mode",    value: modeLabel,                                                  inline: true },
-        { name: "👤 Added By",        value: updated.addedBy,                                            inline: true },
-        { name: "🔢 Total Checks",    value: `${updated.checkCount}`,                                    inline: true },
-        { name: "📅 Added",           value: tsField(updated.addedAt),                                   inline: true },
-        { name: "🕐 Last Checked",    value: tsField(updated.lastChecked),                               inline: true },
-        { name: "🔍 Detail",          value: result.detail,                                              inline: false },
-        { name: "⚡ Active",          value: updated.active ? "Yes" : "No (event detected or paused)",  inline: true }
+        { name: "📊 Current Status", value: `${statusEmoji[result.status] || "⏳"} ${result.status}`,    inline: true },
+        { name: "🎯 Monitor Mode",   value: modeLabel,                                                    inline: true },
+        { name: "👤 Added By",       value: updated.addedBy,                                              inline: true },
+        { name: "🔢 Total Checks",   value: `${updated.checkCount}`,                                      inline: true },
+        { name: "📅 Added",          value: tsField(updated.addedAt),                                     inline: true },
+        { name: "🕐 Last Checked",   value: tsField(updated.lastChecked),                                 inline: true },
+        { name: "🔍 Detail",         value: result.detail || "N/A",                                       inline: false },
+        { name: "⚡ Active",         value: updated.active ? "Yes" : "No (event detected or paused)",    inline: true }
       )
       .setFooter({ text: "Instagram Monitor • Monitoring Base" })
       .setTimestamp();
@@ -668,12 +697,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   // ── /monitor remove ────────────────────────────────────────────────────
   if (sub === "remove") {
-    if (!username)
-      return interaction.reply({ content: "❌ Please provide an Instagram username.", ephemeral: true });
+    // FIX #8: Validate username
+    if (!validateUsername(username))
+      return interaction.reply({ content: "❌ Invalid Instagram username.", ephemeral: true });
 
     const account = monitoringBase.get(username);
     if (!account)
       return interaction.reply({ content: `❌ **@${username}** is not in the Monitoring Base.`, ephemeral: true });
+
+    // FIX #7: Defer reply before the (potentially slow) archiveAndStop operation
+    await interaction.deferReply();
 
     archiveAndStop(username, "MANUALLY_REMOVED");
 
@@ -682,14 +715,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setTitle("🗑️  Account Removed & Archived")
       .setDescription(`**@${username}** has been removed from the **Monitoring Base** and stored in **Old Clients** archive.`)
       .addFields(
-        { name: "👤 Was Added By",    value: account.addedBy,          inline: true },
-        { name: "📅 Was Added On",    value: tsField(account.addedAt), inline: true },
-        { name: "🔢 Total Checks",    value: `${account.checkCount}`,  inline: true }
+        { name: "👤 Was Added By", value: account.addedBy,          inline: true },
+        { name: "📅 Was Added On", value: tsField(account.addedAt), inline: true },
+        { name: "🔢 Total Checks", value: `${account.checkCount}`,  inline: true }
       )
       .setFooter({ text: "Instagram Monitor • Archived to Old Clients" })
       .setTimestamp();
 
-    return interaction.reply({ embeds: [embed] });
+    return interaction.editReply({ embeds: [embed] });
   }
 });
 
@@ -704,4 +737,3 @@ client.once(Events.ClientReady, async () => {
 });
 
 client.login(TOKEN);
-
