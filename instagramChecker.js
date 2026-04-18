@@ -1,13 +1,22 @@
 /**
  * instagramChecker.js
  * Safely checks if an Instagram account is accessible (unbanned)
- * WITHOUT logging in — uses only public profile endpoint.
+ * WITHOUT logging in — uses public profile + API endpoints.
  * Rotates user agents to reduce bot fingerprinting risk.
  * Supports HTTP proxy via PROXY_URL env variable.
+ *
+ * Strategy (most reliable first):
+ *  1. Hit the public JSON endpoint  ?__a=1&__d=dis  → cleanest signal
+ *  2. Fall back to scraping the HTML profile page
+ *  3. If both are ambiguous → ERROR (never assume banned)
+ *
+ * KEY INSIGHT: Instagram almost always shows a login wall (HTTP 200 + login HTML)
+ * for real accounts. A login wall = account EXISTS = ACCESSIBLE.
+ * Never assume BANNED from ambiguous signals — only from explicit 404 / "not available" page.
  */
-
+ 
 const axios = require("axios");
-
+ 
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
@@ -15,26 +24,20 @@ const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 ];
-
+ 
 let uaIndex = 0;
 function getNextUserAgent() {
   const ua = USER_AGENTS[uaIndex % USER_AGENTS.length];
   uaIndex++;
   return ua;
 }
-
-// FIX #1: jitter() no longer returns negative values.
-// Old code: baseMs + random(0, 6000) - 3000 → could produce baseMs - 3000 which is negative
-// when baseMs (e.g. 12000) - 3000 = 9000 (fine), but edge: if base < 3000, result < 0
-// New code: always adds a positive variance on top of base, so result is always >= base
+ 
+// Always adds positive variance — never returns negative ms
 function jitter(baseMs) {
-  const variance = 3000;
-  return baseMs + Math.floor(Math.random() * variance);
+  return baseMs + Math.floor(Math.random() * 3000);
 }
-
-// ── Proxy config ────────────────────────────────────────────────────────────
-// FIX #2: Build proxy config fresh on each request so PROXY_URL changes at runtime
-// are picked up without restarting the bot. Also prevents stale module-level state.
+ 
+// Built fresh on every call so PROXY_URL changes at runtime are picked up
 function getProxyConfig() {
   const proxyUrl = process.env.PROXY_URL;
   if (!proxyUrl) return null;
@@ -57,42 +60,27 @@ function getProxyConfig() {
     return null;
   }
 }
-
-// Log proxy status once on startup (informational only)
-const _initialProxy = getProxyConfig();
-if (_initialProxy) {
-  console.log(`🔀 Proxy enabled: ${_initialProxy.host}:${_initialProxy.port}`);
+ 
+// Log proxy status once at startup
+const _initProxy = getProxyConfig();
+if (_initProxy) {
+  console.log(`🔀 Proxy enabled: ${_initProxy.host}:${_initProxy.port}`);
 } else {
   console.warn("⚠️  No PROXY_URL set — requests will use the server's IP.");
 }
-
+ 
+// ── Status constants ────────────────────────────────────────────────────────
 const STATUS = {
   BANNED:       "BANNED",
   ACCESSIBLE:   "ACCESSIBLE",
   RATE_LIMITED: "RATE_LIMITED",
   ERROR:        "ERROR",
 };
-
-/**
- * Check if an Instagram username is currently accessible.
- * Uses the public profile URL — no login, no credentials.
- *
- * Detection logic (in order of reliability):
- * 1. HTTP 404       → definitely BANNED
- * 2. HTTP 429       → RATE_LIMITED
- * 3. "not available" text on page → BANNED
- * 4. Strong positive signals (username in JSON, og:title with name) → ACCESSIBLE
- * 5. Login wall / "log in to continue" → treat as ACCESSIBLE (account exists, just gated)
- * 6. Anything else ambiguous → ERROR (don't assume banned)
- */
-async function checkAccount(username) {
-  const url       = `https://www.instagram.com/${username}/`;
-  const checkedAt = new Date();
-
-  // FIX #2: Get proxy config fresh on every call
+ 
+// ── Shared request config builder ──────────────────────────────────────────
+function buildRequestConfig(extraHeaders = {}) {
   const proxyConfig = getProxyConfig();
-
-  const requestConfig = {
+  const config = {
     timeout:      15000,
     maxRedirects: 5,
     headers: {
@@ -107,94 +95,179 @@ async function checkAccount(username) {
       "Sec-Fetch-Site":            "none",
       "Cache-Control":             "no-cache",
       Pragma:                      "no-cache",
+      ...extraHeaders,
     },
-    validateStatus: () => true,
+    validateStatus: () => true, // never throw on any HTTP status
   };
-
-  if (proxyConfig) {
-    requestConfig.proxy = proxyConfig;
-  }
-
+  if (proxyConfig) config.proxy = proxyConfig;
+  return config;
+}
+ 
+// ── Banned-page phrase detector (shared between both methods) ──────────────
+function isDefinitelyBannedHtml(html) {
+  return (
+    html.includes("Sorry, this page isn\u2019t available.") || // unicode apostrophe
+    html.includes("Sorry, this page isn't available.")       || // straight apostrophe
+    html.includes("The link you followed may be broken")     ||
+    html.includes("the page may have been removed")
+  );
+}
+ 
+// ── Login-wall detector (shared between both methods) ─────────────────────
+// IMPORTANT: A login wall means the account EXISTS — Instagram just wants you to log in.
+// This is NOT a ban signal. Treat as ACCESSIBLE.
+function isLoginWall(html) {
+  return (
+    html.includes("Log in to Instagram")           ||
+    html.includes("log_in")                        ||
+    html.includes("loginForm")                     ||
+    html.includes("You must be 18")                ||
+    html.includes("to see photos and videos")      ||
+    html.includes("Sign up to see")                ||
+    html.includes("instagram.com/accounts/login")
+  );
+}
+ 
+// ── METHOD 1: Public JSON endpoint ─────────────────────────────────────────
+// Instagram exposes ?__a=1&__d=dis on profile URLs.
+//   Account exists  → JSON with user data     → ACCESSIBLE
+//   Account banned  → 404 or JSON error       → BANNED
+//   Rate limited    → 429                     → RATE_LIMITED
+//   Auth required   → 401 or login-wall HTML  → ACCESSIBLE (account exists)
+async function checkViaJsonEndpoint(username) {
+  const url = `https://www.instagram.com/${username}/?__a=1&__d=dis`;
   try {
-    const response = await axios.get(url, requestConfig);
+    const response = await axios.get(url, buildRequestConfig({
+      Accept:               "application/json, text/javascript, */*; q=0.01",
+      "X-Requested-With":   "XMLHttpRequest",
+      "X-IG-App-ID":        "936619743392459", // public Instagram web app ID
+    }));
+ 
     const { status: httpStatus, data } = response;
-
-    // ── 1. Clear HTTP signals ──────────────────────────────────────────────
-    if (httpStatus === 429) {
-      return { status: STATUS.RATE_LIMITED, checkedAt, detail: "Rate limited by Instagram (429). Backing off." };
-    }
-
-    // FIX #3: 407 Proxy Auth failure — log clearly and return ERROR so caller can back off
+ 
+    if (httpStatus === 429) return { status: STATUS.RATE_LIMITED, detail: "Rate limited (429) on JSON endpoint." };
     if (httpStatus === 407) {
-      console.error("❌ Proxy authentication failed (407). Check your PROXY_URL credentials.");
-      return { status: STATUS.ERROR, checkedAt, detail: "Proxy authentication failed (407). Check PROXY_URL." };
+      console.error("❌ Proxy auth failed (407). Check PROXY_URL credentials.");
+      return { status: STATUS.ERROR, detail: "Proxy authentication failed (407)." };
     }
-
-    if (httpStatus === 404) {
-      return { status: STATUS.BANNED, checkedAt, detail: "Profile not found (HTTP 404) — account is banned/deleted." };
+    if (httpStatus === 404) return { status: STATUS.BANNED,     detail: "JSON endpoint 404 — account banned/deleted." };
+    if (httpStatus === 401) return { status: STATUS.ACCESSIBLE, detail: "Auth required (401) — account exists." };
+    if (httpStatus !== 200) return { status: STATUS.ERROR,      detail: `JSON endpoint returned HTTP ${httpStatus}.` };
+ 
+    // Try to parse as JSON
+    let json = null;
+    if (typeof data === "object" && data !== null) {
+      json = data;
+    } else if (typeof data === "string") {
+      try { json = JSON.parse(data); } catch { /* not JSON */ }
     }
-
-    if (httpStatus !== 200) {
-      return { status: STATUS.ERROR, checkedAt, detail: `Unexpected HTTP ${httpStatus} — skipping this check.` };
+ 
+    if (json) {
+      // Clear user data present → ACCESSIBLE
+      if (json.graphql?.user || json.data?.user || json.user) {
+        return { status: STATUS.ACCESSIBLE, detail: "User data found in JSON response." };
+      }
+      // Login required response → account exists → ACCESSIBLE
+      if (json.require_login || json.message === "login_required") {
+        return { status: STATUS.ACCESSIBLE, detail: "Login required in JSON — account exists." };
+      }
+      // Explicit failure → BANNED
+      if (json.status === "fail" || json.message === "No user found") {
+        return { status: STATUS.BANNED, detail: `JSON reports failure: ${json.message || "no user found"}` };
+      }
+      // Other JSON but no clear signal → ERROR
+      return { status: STATUS.ERROR, detail: "JSON response had no clear user/error field." };
     }
-
-    // ── 2. HTTP 200 — analyse page content ────────────────────────────────
-    const html = typeof data === "string" ? data : JSON.stringify(data);
-
-    // BANNED signals — only trust very specific phrases
-    const definitelyBanned =
-      html.includes("Sorry, this page isn\u2019t available.") || // unicode apostrophe
-      html.includes("Sorry, this page isn't available.")       || // straight apostrophe
-      html.includes("The link you followed may be broken")     ||
-      html.includes("the page may have been removed");
-
-    if (definitelyBanned) {
-      return { status: STATUS.BANNED, checkedAt, detail: "Page shows definitive 'not available' message." };
-    }
-
-    // LOGIN WALL — Instagram is blocking the view but the account EXISTS
-    // This is NOT a ban — treat as ACCESSIBLE
-    const loginWall =
-      html.includes("Log in to Instagram") ||
-      html.includes("log_in")              ||
-      html.includes("loginForm")           ||
-      html.includes("You must be 18")      ||
-      html.includes("to see photos and videos") ||
-      html.includes("Sign up to see");
-
-    if (loginWall) {
-      return { status: STATUS.ACCESSIBLE, checkedAt, detail: "Login wall shown — account exists and is accessible." };
-    }
-
-    // FIX #4: Tightened ACCESSIBLE detection.
-    // Old: html.includes(`/@${usernameLower}`) — too loose, matched unrelated nav links
-    // New: only match patterns that are specifically about THIS profile's data
-    const usernameLower        = username.toLowerCase();
-    const definitelyAccessible =
-      html.includes(`"username":"${usernameLower}"`)    ||
-      html.includes(`"username": "${usernameLower}"`)   ||
-      // Only match instagram.com/USERNAME as a canonical URL (og:url or ld+json), not nav
-      html.includes(`"https://www.instagram.com/${usernameLower}/"`) ||
-      html.includes(`"ProfilePage"`)                    ||
-      html.includes(`"graphql"`)                        ||
-      (html.includes("og:title") && html.toLowerCase().includes(usernameLower));
-
-    if (definitelyAccessible) {
-      return { status: STATUS.ACCESSIBLE, checkedAt, detail: "Profile data found — account is accessible." };
-    }
-
-    // AMBIGUOUS — don't assume banned, treat as ERROR so we retry
-    return { status: STATUS.ERROR, checkedAt, detail: "Ambiguous response — will retry next cycle." };
-
+ 
+    // Not JSON — got HTML on the JSON endpoint (common when Instagram serves login wall)
+    const html = typeof data === "string" ? data : "";
+    if (isDefinitelyBannedHtml(html)) return { status: STATUS.BANNED,     detail: "Banned-page HTML on JSON endpoint." };
+    if (isLoginWall(html))            return { status: STATUS.ACCESSIBLE, detail: "Login wall HTML on JSON endpoint — account exists." };
+ 
+    return { status: STATUS.ERROR, detail: "Non-JSON, non-login-wall response on JSON endpoint." };
+ 
   } catch (err) {
     if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
-      return { status: STATUS.ERROR, checkedAt, detail: "Request timed out — will retry." };
+      return { status: STATUS.ERROR, detail: "JSON endpoint timed out." };
     }
-    if (err.code === "ECONNREFUSED" || err.code === "ENOTFOUND") {
-      return { status: STATUS.ERROR, checkedAt, detail: `Connection failed: ${err.message}` };
-    }
-    return { status: STATUS.ERROR, checkedAt, detail: err.message };
+    return { status: STATUS.ERROR, detail: `JSON endpoint exception: ${err.message}` };
   }
 }
-
+ 
+// ── METHOD 2: HTML profile page fallback ───────────────────────────────────
+// Only used when METHOD 1 returns ERROR (ambiguous).
+async function checkViaHtmlPage(username) {
+  const url = `https://www.instagram.com/${username}/`;
+  try {
+    const response = await axios.get(url, buildRequestConfig());
+    const { status: httpStatus, data } = response;
+ 
+    if (httpStatus === 429) return { status: STATUS.RATE_LIMITED, detail: "Rate limited (429) on HTML page." };
+    if (httpStatus === 407) return { status: STATUS.ERROR,        detail: "Proxy auth failed (407)." };
+    if (httpStatus === 404) return { status: STATUS.BANNED,       detail: "HTML page 404 — account banned/deleted." };
+    if (httpStatus !== 200) return { status: STATUS.ERROR,        detail: `HTML page returned HTTP ${httpStatus}.` };
+ 
+    const html = typeof data === "string" ? data : JSON.stringify(data);
+ 
+    // Explicit banned page
+    if (isDefinitelyBannedHtml(html)) {
+      return { status: STATUS.BANNED, detail: "HTML page shows explicit 'not available' message." };
+    }
+ 
+    // Login wall = account EXISTS = ACCESSIBLE
+    // This is the most common response Instagram gives for real accounts
+    if (isLoginWall(html)) {
+      return { status: STATUS.ACCESSIBLE, detail: "Login wall on HTML page — account exists and is accessible." };
+    }
+ 
+    // Profile data visible in page (rare without cookies but possible)
+    const usernameLower = username.toLowerCase();
+    const hasProfileData =
+      html.includes(`"username":"${usernameLower}"`)               ||
+      html.includes(`"username": "${usernameLower}"`)              ||
+      html.includes(`"https://www.instagram.com/${usernameLower}/"`) ||
+      html.includes(`"ProfilePage"`)                               ||
+      html.includes(`"graphql"`)                                   ||
+      (html.includes("og:title") && html.toLowerCase().includes(usernameLower));
+ 
+    if (hasProfileData) {
+      return { status: STATUS.ACCESSIBLE, detail: "Profile data found in HTML page." };
+    }
+ 
+    // Truly ambiguous — do NOT assume banned
+    return { status: STATUS.ERROR, detail: "HTML page response was ambiguous — will retry next cycle." };
+ 
+  } catch (err) {
+    if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
+      return { status: STATUS.ERROR, detail: "HTML page timed out." };
+    }
+    return { status: STATUS.ERROR, detail: `HTML page exception: ${err.message}` };
+  }
+}
+ 
+// ── MAIN EXPORT ────────────────────────────────────────────────────────────
+/**
+ * Check if an Instagram username is currently accessible.
+ * Tries JSON endpoint first, falls back to HTML scrape if ambiguous.
+ * NEVER reports BANNED from ambiguous responses — only explicit 404 / banned-page signals.
+ */
+async function checkAccount(username) {
+  const checkedAt = new Date();
+ 
+  // Step 1: Try the JSON endpoint (fastest and most reliable)
+  const jsonResult = await checkViaJsonEndpoint(username);
+  console.log(`  [JSON] @${username} → ${jsonResult.status}: ${jsonResult.detail}`);
+ 
+  if (jsonResult.status !== STATUS.ERROR) {
+    return { ...jsonResult, checkedAt };
+  }
+ 
+  // Step 2: JSON was ambiguous — fall back to HTML page
+  console.log(`  [HTML] @${username} — JSON ambiguous, trying HTML fallback...`);
+  const htmlResult = await checkViaHtmlPage(username);
+  console.log(`  [HTML] @${username} → ${htmlResult.status}: ${htmlResult.detail}`);
+ 
+  return { ...htmlResult, checkedAt };
+}
+ 
 module.exports = { checkAccount, STATUS, jitter };
