@@ -148,48 +148,102 @@ async function notifyAccountBanned(username, account) {
   await channel.send({ content: pingContent, embeds: [embed], components: [row] });
 }
 
+// ── Fetch Instagram profile data (photo + followers) ──────────────────────
+async function fetchProfileData(username) {
+  const axios = require("axios");
+  try {
+    const url = `https://www.instagram.com/${username}/`;
+    const proxyUrl = process.env.PROXY_URL;
+    const requestConfig = {
+      timeout: 10000,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      validateStatus: () => true,
+    };
+
+    if (proxyUrl) {
+      try {
+        const u = new URL(proxyUrl);
+        requestConfig.proxy = {
+          protocol: u.protocol.replace(":", ""),
+          host: u.hostname,
+          port: Number(u.port || 80),
+          ...(u.username ? { auth: { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) } } : {}),
+        };
+      } catch {}
+    }
+
+    const { data: html } = await axios.get(url, requestConfig);
+    if (typeof html !== "string") return null;
+
+    // Extract profile pic URL from og:image meta tag
+    const picMatch = html.match(/<meta property="og:image" content="([^"]+)"/);
+    const profilePic = picMatch ? picMatch[1] : null;
+
+    // Extract follower / following counts from JSON in page
+    const followersMatch = html.match(/"edge_followed_by":\{"count":(\d+)\}/);
+    const followingMatch = html.match(/"edge_follow":\{"count":(\d+)\}/);
+    const followers = followersMatch ? parseInt(followersMatch[1]).toLocaleString() : null;
+    const following = followingMatch ? parseInt(followingMatch[1]).toLocaleString() : null;
+
+    return { profilePic, followers, following };
+  } catch {
+    return null;
+  }
+}
+
 // ── Notification: BANNED account just got UNBANNED ────────────────────────
 async function notifyAccountUnbanned(username, account) {
   const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
   if (!channel) return;
 
-  const now          = Date.now();
-  const unbannedAt   = new Date(now);
-  const timeTaken    = account.addedAt
+  const now       = Date.now();
+  const timeTaken = account.addedAt
     ? formatDuration(now - new Date(account.addedAt).getTime())
     : "unknown";
 
-  let adderMention = `**${account.addedBy}**`;
-  if (account.addedById) {
-    adderMention = `<@${account.addedById}>`;
+  const unbannedAt = new Date(now).toISOString();
+
+  // Fetch live profile data
+  const profile = await fetchProfileData(username);
+
+  const pingContent = account.addedById
+    ? `<@${account.addedById}>`
+    : `@here`;
+
+  // Build clean recovery embed
+  const embed = new EmbedBuilder()
+    .setColor(0x00e676)
+    .setTitle(`Account Recovered | @${username} ✅`)
+    .setURL(`https://instagram.com/${username}`);
+
+  // Add follower/following if we got them
+  if (profile?.followers || profile?.following) {
+    const followersVal = profile.followers ? `**${profile.followers}**` : "N/A";
+    const followingVal = profile.following ? `**${profile.following}**` : "N/A";
+    embed.setDescription(`Followers: ${followersVal} | Following: ${followingVal}`);
   }
 
-  const embed = new EmbedBuilder()
-    .setColor(0x00ff88)
-    .setTitle("✅  Client Account Has Been Recovered!")
-    .setDescription(
-      `Hey ${adderMention}! Your client's account **@${username}** is now **UN-BANNED** and back on Instagram! 🎉`
-    )
-    .addFields(
-      { name: "🎯 Client Account",       value: `[@${username}](https://instagram.com/${username})`, inline: true },
-      { name: "👤 Added By",             value: account.addedBy,                                     inline: true },
-      { name: "🕐 Unbanned At",          value: tsField(unbannedAt.toISOString()),                   inline: false },
-      { name: "⏱️ Time Taken to Unban",  value: timeTaken,                                           inline: true },
-      { name: "🔢 Total Checks Done",    value: `${account.checkCount}`,                             inline: true }
-    )
-    .setFooter({ text: "Instagram Monitor • Recovery Alert" })
-    .setTimestamp();
+  embed.addFields(
+    { name: "⏱️ Time Taken", value: timeTaken, inline: false },
+  );
+
+  // Set profile photo as thumbnail if available
+  if (profile?.profilePic) {
+    embed.setThumbnail(profile.profilePic);
+  }
+
+  embed.setFooter({ text: `Unbanned at ${new Date(unbannedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST` });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`archive_unban_${username}`).setLabel("📦 Archive & Stop Monitoring").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`keep_unban_${username}`)   .setLabel("🔄 Keep in Monitor List")     .setStyle(ButtonStyle.Secondary)
   );
 
-  const pingContent = account.addedById
-    ? `<@${account.addedById}> ✅ **CLIENT ACCOUNT RECOVERED** — \`@${username}\``
-    : `@here ✅ **CLIENT ACCOUNT RECOVERED** — \`@${username}\``;
-
-  await channel.send({ content: pingContent, embeds: [embed], components: [row] });
+  await channel.send({ content: `${pingContent} ✅ **CLIENT ACCOUNT RECOVERED** — \`@${username}\``, embeds: [embed], components: [row] });
 }
 
 // ── Monitor loops ──────────────────────────────────────────────────────────
