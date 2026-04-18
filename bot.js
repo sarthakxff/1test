@@ -45,6 +45,14 @@ const CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID;
 const GUILD_ID       = process.env.DISCORD_GUILD_ID;
 const BASE_INTERVAL  = parseInt(process.env.CHECK_INTERVAL_MS || "12000", 10);
 
+// ── Warn if DATA_DIR not set (data will be lost on redeploy) ───────────────
+if (!process.env.DATA_DIR) {
+  console.warn("⚠️  WARNING: DATA_DIR env var not set! All monitoring data will be lost on redeploy.");
+  console.warn("⚠️  Set DATA_DIR=/data in Railway Variables and add a Volume mounted at /data.");
+} else {
+  console.log(`💾 Data directory: ${process.env.DATA_DIR}`);
+}
+
 // ── Discord client ─────────────────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -249,6 +257,21 @@ async function notifyAccountUnbanned(username, account) {
 // ── Monitor loops ──────────────────────────────────────────────────────────
 const activeTimers = {};
 
+// Before firing a ban/unban alert, re-check 3 times over 30s to confirm.
+// This prevents false positives from Instagram login walls / flaky responses.
+async function confirmStatus(username, expectedStatus, attempts = 3, delayMs = 10000) {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    const result = await checkAccount(username);
+    console.log(`[CONFIRM ${i + 1}/${attempts}] @${username} -> ${result.status} (expecting ${expectedStatus})`);
+    if (result.status !== expectedStatus) {
+      console.log(`False positive cleared for @${username} — got ${result.status} not ${expectedStatus}`);
+      return false;
+    }
+  }
+  return true;
+}
+
 async function scheduleCheck(username) {
   const account = monitoringBase.get(username);
   if (!account || !account.active) return;
@@ -264,10 +287,10 @@ async function scheduleCheck(username) {
       checkCount:  (prev.checkCount || 0) + 1,
     });
 
-    console.log(`[${new Date().toLocaleTimeString()}] @${username} (${prev.mode}) → ${result.status}`);
+    console.log(`[${new Date().toLocaleTimeString()}] @${username} (${prev.mode}) -> ${result.status}`);
 
     if (result.status === STATUS.RATE_LIMITED) {
-      console.warn(`⚠️  Rate limited on @${username}. Backing off 60s.`);
+      console.warn(`Rate limited on @${username}. Backing off 60s.`);
       activeTimers[username] = setTimeout(() => scheduleCheck(username), 60000);
       return;
     }
@@ -279,19 +302,31 @@ async function scheduleCheck(username) {
 
     const updated = monitoringBase.get(username);
 
-    // WATCH_FOR_BAN: was live, now check if it went down
+    // WATCH_FOR_BAN: was live, now looks banned — confirm 3x before alerting
     if (updated.mode === "WATCH_FOR_BAN" && result.status === STATUS.BANNED) {
+      console.log(`Possible ban detected for @${username} — running 3 confirmation checks...`);
+      const confirmed = await confirmStatus(username, STATUS.BANNED);
+      if (!confirmed) {
+        scheduleCheck(username); // false positive — keep monitoring
+        return;
+      }
       monitoringBase.update(username, {
         active: false,
         eventDetectedAt: result.checkedAt.toISOString(),
         lastStatus: STATUS.BANNED,
       });
       await notifyAccountBanned(username, monitoringBase.get(username));
-      return; // stop loop — button handler or /monitor remove will archive
+      return;
     }
 
-    // WATCH_FOR_UNBAN: was banned, now check if it came back
+    // WATCH_FOR_UNBAN: was banned, now looks accessible — confirm 3x before alerting
     if (updated.mode === "WATCH_FOR_UNBAN" && result.status === STATUS.ACCESSIBLE) {
+      console.log(`Possible unban detected for @${username} — running 3 confirmation checks...`);
+      const confirmed = await confirmStatus(username, STATUS.ACCESSIBLE);
+      if (!confirmed) {
+        scheduleCheck(username); // false positive — keep monitoring
+        return;
+      }
       monitoringBase.update(username, {
         active: false,
         eventDetectedAt: result.checkedAt.toISOString(),
@@ -421,15 +456,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     await interaction.deferReply();
 
-    const firstCheck = await checkAccount(username);
-    const mode       = firstCheck.status === STATUS.ACCESSIBLE ? "WATCH_FOR_BAN" : "WATCH_FOR_UNBAN";
+    // Retry up to 5 times to get a real status (avoid ERROR/RATE_LIMITED on first check)
+    let firstCheck;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      firstCheck = await checkAccount(username);
+      if (firstCheck.status === STATUS.ACCESSIBLE || firstCheck.status === STATUS.BANNED) break;
+      console.log(`[ADD] Attempt ${attempt + 1}: @${username} returned ${firstCheck.status}, retrying...`);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+
+    // If still no clear result after retries, default to WATCH_FOR_UNBAN (safer)
+    const detectedStatus = firstCheck.status === STATUS.ACCESSIBLE ? "ACCESSIBLE" : "BANNED";
+    const mode = detectedStatus === "ACCESSIBLE" ? "WATCH_FOR_BAN" : "WATCH_FOR_UNBAN";
 
     const added = monitoringBase.add(
       username,
       interaction.user.tag,
       interaction.user.id,
       mode,
-      firstCheck.status === STATUS.ACCESSIBLE ? "ACCESSIBLE" : "BANNED"
+      detectedStatus
     );
 
     if (!added.ok) {
@@ -659,3 +704,4 @@ client.once(Events.ClientReady, async () => {
 });
 
 client.login(TOKEN);
+
